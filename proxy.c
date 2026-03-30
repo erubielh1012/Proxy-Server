@@ -8,6 +8,10 @@
 #include <netdb.h>
 #include <pthread.h>
 #include <errno.h>
+#include <CommonCrypto/CommonDigest.h>
+#include <openssl/md5.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 void parse_request(char *buffer, char **method, char **host, char **path, char **port, char **version);
 void *handle_client(void *arg);
@@ -16,6 +20,9 @@ void setup_proxy_socket(int *sockfd, struct sockaddr_in *address, int port);
 int setup_client_socket(int *sockfd, struct sockaddr_in *server_addr, const char *host, int port);
 int is_blocked(char *host);
 int sockaddr_addr_equal(const struct addrinfo *a, const struct addrinfo *b);
+void hash_string(char *input, char *output);
+int check_cache_file(char *hash_string);
+void cache_response(const char *hash_string, const char *data, size_t data_len);
 
 #define PAYLOAD_SIZE 1460
 
@@ -101,6 +108,7 @@ void *handle_client(void *arg) {
         close(conn_fd);
         return NULL;
     }
+    printf("[PROXY] Recevied request from client: \n%s\n", payload);
 
     /* 
     parse request from client.
@@ -130,85 +138,149 @@ void *handle_client(void *arg) {
         close(conn_fd);
         return NULL;
     }
-    // printf("[PROXY] Checkpoint, the method and version are valid\n");
-    // check if url is valid
-    if (!is_valid_host(host)) {
-        send(conn_fd, "HTTP/1.1 400 Bad Request: Invalid host\r\n", 43, 0);
-        close(conn_fd);
-        return NULL;
-    }
-    printf("[PROXY] Host: '%s' is valid\n", host);
 
-    // check if host is blocked
-    if (is_blocked(host)) {
-        printf("[PROXY] Host: '%s' is blocked\n", host);
-        const char *msg = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
-        send(conn_fd, msg, strlen(msg), 0);
-        close(conn_fd);
-        return NULL;
-    }
+    /* *********************CACHE FILE CHECK AND SEND************************** */
+    // create a cache key from the host and path
+    char *dir = "./cache/";
+    const int url_len = strlen(host) + strlen(path) + 2;
+    char *url = malloc(url_len);
+    snprintf(url, url_len, "%s/%s", host, path);
+    printf("[PROXY] URL: '%s'\n", url);
+    char hash[CC_MD5_DIGEST_LENGTH * 2 + 1];
+    hash_string(url, hash);
+    printf("[PROXY] Filename Hash: '%s'\n", hash);
+    free(url);
+    const int cache_path_len = (CC_MD5_DIGEST_LENGTH * 2 + 1) + strlen(dir);
+    char *cache_path = malloc(cache_path_len);
+    snprintf(cache_path, cache_path_len, "%s%s", dir, hash);
+    printf("[PROXY] Cache path: '%s'\n", cache_path);
 
-    // create second socket connection to indicated HTTP server
-    if (setup_client_socket(&server_fd, &server_address, host, atoi(port)) < 0) {
-        printf("[PROXY] Failed to setup client socket\n");
-        const char *msg = "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n";
-        send(conn_fd, msg, strlen(msg), 0);
-        close(conn_fd);
-        return NULL;
-    }
-
-    // setup a timeout if the server does not respond within 2 seconds
-    setsockopt(server_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-    /*
-        construct a new HTTP request and forward to indicated HTTP server
-        format needs to be as such:
-            GET /<path> HTTP/1.1\r\n
-            Host: <host>\r\n
-            Connection: close\r\n
-            \r\n
-        where <path> is the path of the url and <host> is the host of the url.
-
-        For example, if the url is http://www.yahoo.com/news/articles/iranian-military-mocks-trumps-claim-042851486.html,
-        then the path is /news/articles/iranian-military-mocks-trumps-claim-042851486.html and the host is www.yahoo.com.
-        Then the payload should be:
-            GET /news/articles/iranian-military-mocks-trumps-claim-042851486.html HTTP/1.1\r\n
-            Host: www.yahoo.com\r\n
-            Connection: close\r\n
-            \r\n
-    */
-    char new_payload[PAYLOAD_SIZE] = {0};
-    snprintf(new_payload, PAYLOAD_SIZE,
-        "GET /%s HTTP/1.1\r\n"
-        "Host: %s:%s\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        path, host, port);
-    printf("[PROXY] Request payload: \n%s\n", new_payload);
-    // forward request to indicated HTTP server
-    send(server_fd, new_payload, strlen(new_payload), 0);
-
-    printf("[PROXY] Forwarding request to server\n");
-    // read response from indicated HTTP server
-    bzero(payload, PAYLOAD_SIZE);
-    while ((n = read(server_fd, payload, PAYLOAD_SIZE)) > 0) {
-        // forward response to client
-        send(conn_fd, payload, n, 0);
-        bzero(payload, PAYLOAD_SIZE);
-    }
-
-    if (n == 0) {
-        printf("[PROXY] Server closed connection\n");
-    } else if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            printf("[PROXY] Server response timed out\n");
-        } else {
-            perror("[PROXY] read failed");
+    if (check_cache_file(hash) == 0) {
+        printf("[PROXY] Cache file exists, sending to client\n");
+        // cache file exists, read the file and send it to the client
+        FILE *file = fopen(cache_path, "r");
+        if (file == NULL) {
+            perror("[PROXY] fopen failed");
+            return NULL;
         }
+
+        // Determine cached payload length for Content-Length.
+        if (fseek(file, 0, SEEK_END) != 0) {
+            perror("[PROXY] fseek failed");
+            fclose(file);
+            return NULL;
+        }
+        long file_size = ftell(file);
+        if (file_size < 0) file_size = 0;
+        rewind(file);
+
+        char cache_response[PAYLOAD_SIZE] = {0};
+        snprintf(cache_response, PAYLOAD_SIZE,
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Length: %ld\r\n"
+                "\r\n",
+                file_size);
+        printf("[PROXY] Cache response: \n%s\n", cache_response);
+
+        // Send header first, then stream the cached file bytes.
+        send(conn_fd, cache_response, strlen(cache_response), 0);
+
+        char buf[PAYLOAD_SIZE];
+        size_t nread;
+        while ((nread = fread(buf, 1, sizeof(buf), file)) > 0) {
+            send(conn_fd, buf, nread, 0);
+        }
+        fclose(file);
+    } else {
+        printf("[PROXY] Cache file does not exist, fetching from server\n");
+
+        // printf("[PROXY] Checkpoint, the method and version are valid\n");
+        // check if url is valid
+        if (!is_valid_host(host)) {
+            send(conn_fd, "HTTP/1.1 400 Bad Request: Invalid host\r\n", 43, 0);
+            close(conn_fd);
+            return NULL;
+        }
+        printf("[PROXY] Host: '%s' is valid\n", host);
+    
+        // check if host is blocked
+        if (is_blocked(host)) {
+            printf("[PROXY] Host: '%s' is blocked\n", host);
+            const char *msg = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
+            send(conn_fd, msg, strlen(msg), 0);
+            close(conn_fd);
+            return NULL;
+        }
+    
+        // create second socket connection to indicated HTTP server
+        if (setup_client_socket(&server_fd, &server_address, host, atoi(port)) < 0) {
+            printf("[PROXY] Failed to setup client socket\n");
+            const char *msg = "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n";
+            send(conn_fd, msg, strlen(msg), 0);
+            close(conn_fd);
+            return NULL;
+        }
+    
+        // setup a timeout if the server does not respond within 2 seconds
+        setsockopt(server_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    
+        /*
+            construct a new HTTP request and forward to indicated HTTP server
+            format needs to be as such:
+                GET /<path> HTTP/1.1\r\n
+                Host: <host>\r\n
+                Connection: close\r\n
+                \r\n
+            where <path> is the path of the url and <host> is the host of the url.
+    
+            For example, if the url is http://www.yahoo.com/news/articles/iranian-military-mocks-trumps-claim-042851486.html,
+            then the path is /news/articles/iranian-military-mocks-trumps-claim-042851486.html and the host is www.yahoo.com.
+            Then the payload should be:
+                GET /news/articles/iranian-military-mocks-trumps-claim-042851486.html HTTP/1.1\r\n
+                Host: www.yahoo.com\r\n
+                Connection: close\r\n
+                \r\n
+        */
+        char new_payload[PAYLOAD_SIZE] = {0};
+        snprintf(new_payload, PAYLOAD_SIZE,
+            "GET /%s HTTP/1.1\r\n"
+            "Host: %s:%s\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            path, host, port);
+        printf("[PROXY] Request payload: \n%s\n", new_payload);
+        // forward request to indicated HTTP server
+        send(server_fd, new_payload, strlen(new_payload), 0);
+    
+        printf("[PROXY] Forwarding request to server\n");
+        int first_chunk = 1;
+        char *body = NULL;
+        size_t body_len = 0;
+        // read response from indicated HTTP server
+        bzero(payload, PAYLOAD_SIZE);
+        while ((n = read(server_fd, payload, PAYLOAD_SIZE)) > 0) {
+            printf("[PROXY] Received response from server: \n%s\n", payload);
+            // get payload from response and cache it
+            if (first_chunk) {
+                first_chunk = 0;
+                char *response_start = strstr(payload, "\r\n\r\n");
+                body = response_start + 4;
+                body_len = (size_t)(n - ((response_start + 4) - payload));
+            } else {
+                body = payload;
+                body_len = n;
+            }
+            // cache the response
+            cache_response(hash, body, body_len);
+            // forward response to client
+            send(conn_fd, payload, n, 0);
+            bzero(payload, PAYLOAD_SIZE);
+        }
+    
+        // close the second and client sockets
+        close(server_fd);
     }
 
-    // close the second and client sockets
-    close(server_fd);
     close(conn_fd);
     return NULL;
 }
@@ -371,21 +443,21 @@ void setup_proxy_socket(int *sockfd, struct sockaddr_in *address, int port) {
 }
 
 int setup_client_socket(int *sockfd, struct sockaddr_in *address, const char *host, int port) {
-    struct hostent *server;
+    struct hostent *he;
 
     if ((*sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("[PROXY] socket failed");
         return -1;
     }
-    server = gethostbyname(host);
-    if (server == NULL) {
+    he = gethostbyname(host);
+    if (he == NULL) {
         herror("[PROXY] gethostbyname failed");
         close(*sockfd);
         return -1;
     }
     address->sin_family = AF_INET;
-    bcopy((char *)server->h_addr, (char *)&address->sin_addr.s_addr, server->h_length);
     address->sin_port = htons(port);
+    memcpy(&address->sin_addr.s_addr, he->h_addr_list[0], he->h_length);
     if (connect(*sockfd, (struct sockaddr *)address, sizeof(*address)) < 0) {
         perror("[PROXY] connect failed");
         close(*sockfd);
@@ -472,4 +544,60 @@ int is_blocked(char *host) {
     fclose(file);
     freeaddrinfo(host_res);
     return 0;
+}
+
+void hash_string(char *input, char *output) {
+    unsigned char digest[CC_MD5_DIGEST_LENGTH];
+    CC_MD5(input, strlen(input), digest);
+
+    for (int i = 0; i < CC_MD5_DIGEST_LENGTH; i++) {
+        sprintf(output + i * 2, "%02x", digest[i]);
+    }
+    
+    output[CC_MD5_DIGEST_LENGTH * 2] = '\0';
+}
+
+int check_cache_file(char *hash_string) {
+    // 0 => cached file exists, 1 => not found, -1 => error
+    DIR *dir = opendir("./cache");
+    if (dir == NULL) {
+        // cache directory does not exist, attempt to create it
+        if (mkdir("./cache", 0755) != 0) {
+            perror("[PROXY] mkdir failed");
+            return -1;
+        }
+        return 1; // newly-created dir, file obviously not present
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        // Some filesystems don't fill d_type reliably; we keep this simple.
+        if (entry->d_type == DT_REG && strcmp(entry->d_name, hash_string) == 0) {
+            closedir(dir);
+            return 0;
+        }
+    }
+
+    closedir(dir);
+    return 1;
+}
+
+void cache_response(const char *hash_string, const char *data, size_t data_len) {
+    // Cache file path is "./cache/<md5-hex>".
+    char path[512];
+    snprintf(path, sizeof(path), "./cache/%s", hash_string);
+
+    FILE *f = fopen(path, "ab");
+    if (f == NULL) {
+        perror("[PROXY] cache_response fopen failed");
+        return;
+    }
+
+    // printf("[PROXY] Caching response: \n%s\n" , data);
+
+    if (data_len > 0) {
+        fwrite(data, 1, data_len, f);
+    }
+
+    fclose(f);
 }

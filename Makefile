@@ -1,6 +1,10 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2
 
+# OpenSSL (Homebrew) include/library paths for macOS
+OPENSSL_INC = -I/opt/homebrew/opt/openssl@3/include -I/usr/local/opt/openssl@3/include
+OPENSSL_LIB = -L/opt/homebrew/opt/openssl@3/lib -L/usr/local/opt/openssl@3/lib
+
 TARGET = proxy
 SRCS = proxy.c
 
@@ -8,11 +12,12 @@ CLIENT = client
 CLIENT_SRCS = client.c
 SERVER = server
 SERVER_SRCS = server.c
+MD5_LIBS = -lssl -lcrypto
 
 all: $(TARGET) $(CLIENT) #$(SERVER)
 
 $(TARGET): $(SRCS)
-	$(CC) $(CFLAGS) $(SRCS) -o $(TARGET) $(LIBS)
+	$(CC) $(CFLAGS) $(OPENSSL_INC) $(SRCS) -o $(TARGET) $(LIBS) $(OPENSSL_LIB) $(MD5_LIBS)
 
 $(CLIENT): $(CLIENT_SRCS)
 	$(CC) $(CFLAGS) $(CLIENT_SRCS) -o $(CLIENT) $(LIBS)
@@ -33,3 +38,4 @@ clean:
 	rm -f $(TARGET)
 	rm -f $(CLIENT)
 	rm -f $(SERVER)
+	rm -rf ./cache
