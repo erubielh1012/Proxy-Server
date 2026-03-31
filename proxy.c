@@ -17,6 +17,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 
 void parse_request(char *buffer, char **method, char **host, char **path, char **port, char **version);
 void *handle_client(void *arg);
@@ -28,6 +29,7 @@ int sockaddr_addr_equal(const struct addrinfo *a, const struct addrinfo *b);
 void hash_string(char *input, char *output);
 int check_cache_file(char *hash_string);
 void cache_response(const char *hash_string, const char *data, size_t data_len);
+int cache_is_expired(const char *cache_path, int timeout_secs);
 
 #define PAYLOAD_SIZE 1460
 
@@ -159,7 +161,7 @@ void *handle_client(void *arg) {
     snprintf(cache_path, MD5_DIGEST_LENGTH * 2 + 1 + strlen(dir), "%s%s", dir, hash);
     printf("[PROXY] Cache path: '%s'\n", cache_path);
 
-    if (check_cache_file(hash) == 0) {
+    if (check_cache_file(hash) == 0 && !cache_is_expired(cache_path, timeout_secs)) {
         printf("[PROXY] Cache file exists, sending to client\n");
         // cache file exists, read the file and send it to the client
         FILE *file = fopen(cache_path, "r");
@@ -196,6 +198,9 @@ void *handle_client(void *arg) {
         }
         fclose(file);
     } else {
+        if (check_cache_file(hash) == 0 && cache_is_expired(cache_path, timeout_secs)) {
+            remove(cache_path);
+        }
         printf("[PROXY] Cache file does not exist, fetching from server\n");
 
         // printf("[PROXY] Checkpoint, the method and version are valid\n");
@@ -602,3 +607,15 @@ void cache_response(const char *hash_string, const char *data, size_t data_len) 
 
     fclose(f);
 }
+
+int cache_is_expired(const char *cache_path, int timeout_secs) {
+    struct stat st;
+    if (stat(cache_path, &st) != 0) {
+        return 1;
+    }
+    if ((time(NULL) - st.st_mtime) >= timeout_secs) {
+        return 1;
+    }
+    return 0;
+}
+
