@@ -1,17 +1,22 @@
+#define _POSIX_C_SOURCE 200112L
+#define _DEFAULT_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <errno.h>
-#include <CommonCrypto/CommonDigest.h>
+// #include <CommonCrypto/CommonDigest.h>
 #include <openssl/md5.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 void parse_request(char *buffer, char **method, char **host, char **path, char **port, char **version);
 void *handle_client(void *arg);
@@ -146,13 +151,12 @@ void *handle_client(void *arg) {
     char *url = malloc(url_len);
     snprintf(url, url_len, "%s/%s", host, path);
     printf("[PROXY] URL: '%s'\n", url);
-    char hash[CC_MD5_DIGEST_LENGTH * 2 + 1];
+    char hash[MD5_DIGEST_LENGTH * 2 + 1];
     hash_string(url, hash);
     printf("[PROXY] Filename Hash: '%s'\n", hash);
     free(url);
-    const int cache_path_len = (CC_MD5_DIGEST_LENGTH * 2 + 1) + strlen(dir);
-    char *cache_path = malloc(cache_path_len);
-    snprintf(cache_path, cache_path_len, "%s%s", dir, hash);
+    char cache_path[(MD5_DIGEST_LENGTH * 2 + 1) + strlen(dir)];
+    snprintf(cache_path, MD5_DIGEST_LENGTH * 2 + 1 + strlen(dir), "%s%s", dir, hash);
     printf("[PROXY] Cache path: '%s'\n", cache_path);
 
     if (check_cache_file(hash) == 0) {
@@ -259,7 +263,6 @@ void *handle_client(void *arg) {
         // read response from indicated HTTP server
         bzero(payload, PAYLOAD_SIZE);
         while ((n = read(server_fd, payload, PAYLOAD_SIZE)) > 0) {
-            printf("[PROXY] Received response from server: \n%s\n", payload);
             // get payload from response and cache it
             if (first_chunk) {
                 first_chunk = 0;
@@ -547,14 +550,14 @@ int is_blocked(char *host) {
 }
 
 void hash_string(char *input, char *output) {
-    unsigned char digest[CC_MD5_DIGEST_LENGTH];
-    CC_MD5(input, strlen(input), digest);
+    unsigned char digest[MD5_DIGEST_LENGTH];
+    MD5(input, strlen(input), digest);
 
-    for (int i = 0; i < CC_MD5_DIGEST_LENGTH; i++) {
+    for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
         sprintf(output + i * 2, "%02x", digest[i]);
     }
     
-    output[CC_MD5_DIGEST_LENGTH * 2] = '\0';
+    output[MD5_DIGEST_LENGTH * 2] = '\0';
 }
 
 int check_cache_file(char *hash_string) {
@@ -592,8 +595,6 @@ void cache_response(const char *hash_string, const char *data, size_t data_len) 
         perror("[PROXY] cache_response fopen failed");
         return;
     }
-
-    // printf("[PROXY] Caching response: \n%s\n" , data);
 
     if (data_len > 0) {
         fwrite(data, 1, data_len, f);
